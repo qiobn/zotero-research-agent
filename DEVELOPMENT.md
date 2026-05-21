@@ -125,50 +125,62 @@ project/
 
 ---
 
-### Phase 2 · Project A MCP Server（进行中）
+### Phase 2 · Project A MCP Server ✅
 
 > 目标：师弟师妹能在 Cherry Studio 里通过自然语言操作 Zotero。
 > 工具表面以**用户意图**而非**底层机制**分类，确保 LLM 不会在功能重叠工具间犹豫。
 
 - [x] **2.1 MCP tool surface 设计与实现** ✅
 
-  **9 个工具，4 个意图类别，零功能重叠：**
+  **13 个工具，5 个意图类别，零功能重叠：**
 
   | 类别 | 工具名 | 意图（一句话） |
   |---|---|---|
-  | DISCOVER | `search_papers` | 按主题/关键词/过滤找论文（hybrid: keyword + semantic，RRF 合并） |
-  | DISCOVER | `find_similar_papers` | 给定一篇论文，找库里类似的论文 |
+  | DISCOVER | `search_papers` | 按主题/关键词/过滤找论文（hybrid: keyword + semantic，RRF 合并，cross-encoder 重排） |
+  | DISCOVER | `find_similar_papers` | 给定一篇论文，找库里概念相似的论文（title+abstract 作 query） |
   | DISCOVER | `browse_library` | 浏览库结构（scope = collections / tags / recent / collection_items）|
+  | DISCOVER | `find_duplicates` | 查找库中重复论文（DOI 或归一化标题匹配） |
   | READ | `get_paper` | 单篇论文的元数据 + 摘要 |
   | READ | `get_paper_content` | 读一篇论文内部的段落（query / page / 默认 + 可选 include_annotations） |
+  | READ | `search_annotations` | 跨论文搜索用户的高亮和批注 |
   | WRITE | `suggest_citations` | 为用户草稿段落推荐引用（按论文去重，附 evidence + page） |
   | WRITE | `export_bibliography` | 导出指定论文的 BibTeX / 引文格式 |
+  | WRITE | `add_paper` | 通过 DOI / arXiv ID / URL 添加论文（CrossRef/arXiv 拉元数据，4 级 PDF 瀑布下载） |
   | MANAGE | `add_note` | 给论文加笔记（dry-run + confirm） |
   | MANAGE | `edit_tags` | 批量加/删标签（dry-run + confirm） |
-  | ADMIN | `sync_index` | 同步向量库与 Zotero 库（增量 / force_rebuild） |
+  | MANAGE | `manage_collections` | 创建集合、添加/移除论文到集合（dry-run + confirm） |
+  | ADMIN | `sync_index` | 同步向量库与 Zotero 库（增量版本跟踪 / force_rebuild） |
 
-  设计原则（来自 Writer RAG-MCP 基准 + MCP 2025-06-18 spec）：
+  设计原则：
   - 工具名 = 动词 + 名词
   - description 明示「什么时候用、什么时候**不要**用」
   - 工具间通过 `item_key` 串联，形成 discover → read → cite → manage 链
-  - 在 9 个工具（10-20 安全区下沿），不超过 LLM 选择阈值
+  - 13 个工具处于 10-20 安全区内，不超过 LLM 选择阈值
 
-- [x] **2.2 写操作安全** ✅
-  - `add_note` 与 `edit_tags` 默认 `confirm=False`，先返回 diff 预览
-  - 已知约束：Zotero 7 local API **只读**；写操作返回明确提示，指引切换 web API
-  - dry-run 内容会附带 `warning` 字段说明此限制
+- [x] **2.2 写操作安全（Hybrid 模式）** ✅
+  - 所有写操作（`add_note` / `edit_tags` / `manage_collections` / `add_paper`）默认 `confirm=False`，先返回 diff 预览
+  - **Hybrid 模式**：`ZOTERO_LOCAL=true` + `ZOTERO_API_KEY` 同时设置时，读走本地 API（快），写走 Web API（可写）
+  - `ZoteroClient.can_write` 属性统一检测写权限，缺少 API key 时返回明确提示
 
-- [ ] **2.3 部署与分发**
+- [x] **2.3 嵌入模型升级** ✅
+  - 从默认 `all-MiniLM-L6-v2` (384d, 英文) 切换到 `BAAI/bge-m3` (1024d, 中英双语)
+  - 通过 `research_core/rag/embedding.py` 统一管理，ChromaDB collection 绑定自定义 embedding function
+  - 中文 query 检索英文论文 score 0.7+，跨语言能力验证通过
+
+- [x] **2.4 检索质量优化** ✅
+  - **Cross-Encoder 重排序**：可选 `cross-encoder/ms-marco-MiniLM-L-6-v2`，对 `search_papers` / `find_similar_papers` / `suggest_citations` 的语义结果重排
+  - **增量索引**：基于 Zotero item version 跟踪，只处理新增/修改/删除的论文；自动检测嵌入模型变更触发全量重建
+  - **PDF 下载 4 级瀑布**：arXiv → Unpaywall → Semantic Scholar → PMC
+
+- [x] **2.5 文档与配置** ✅
+  - `docs/cherry-studio-setup.md`：面向实验室成员的 Cherry Studio 配置指南
+  - `.env.example`：完整环境变量模板（Zotero / Embedding / Reranker / ChromaDB）
+  - 30 个集成测试覆盖全部 13 个工具
+
+- [ ] **2.6 部署与分发**（下一步）
   - 编写 `Dockerfile` + `docker-compose.yml`
   - 部署到实验室服务器（SSE / streamable-http 对外）
-  - 编写 `docs/cherry-studio-setup.md`：Cherry Studio 配置截图 + JSON 模板
   - 做一次 30 分钟培训
-
-- [ ] **2.4 缺口与下一轮迭代**
-  - 中文嵌入：当前默认 ChromaDB 内置 `all-MiniLM-L6-v2` 对中文检索分数偏低，下一步切 `bge-m3`
-  - 写支持：评估 Zotero 7.1+ 的 local write 是否开放，否则文档化 web API 路径
-  - 未实现但有需求的工具（Phase 2 后期）：`add_paper_by_doi/url`、`manage_collections`、`find_duplicates`
-  - 调用日志：接入 Langfuse trace 每个 tool 的调用频次与耗时
 
 ---
 
