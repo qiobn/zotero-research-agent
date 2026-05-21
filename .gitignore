@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+
+# Environment (contains API keys)
+.env
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+
+# ChromaDB / Vector store
+.chroma_db/
+
+# Sync state (generated per-machine)
+_sync_state.json
+
+# Ruff
+.ruff_cache/
+
+# uv
+.local/
+uv.lock
+
+# pytest
+.pytest_cache/
+htmlcov/
+.coverage
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (Project B frontend, future)
+node_modules/
+.next/
+out/
