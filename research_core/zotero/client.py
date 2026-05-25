@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import unicodedata
+from functools import wraps
+from typing import TypeVar
 from urllib.parse import unquote, urlparse
 
 import httpx
@@ -16,6 +19,19 @@ from loguru import logger
 from pyzotero import zotero
 
 from research_core.zotero.models import Annotation, Item
+
+F = TypeVar("F")
+
+_api_lock = threading.RLock()
+
+
+def _with_lock(func: F) -> F:
+    """Serialize Zotero API calls to prevent concurrent request corruption."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        with _api_lock:
+            return func(*args, **kwargs)
+    return wrapper  # type: ignore[return-value]
 
 
 class ZoteroClient:
@@ -64,6 +80,7 @@ class ZoteroClient:
 
     # ── Read: items ───────────────────────────────────────────
 
+    @_with_lock
     def search_items(
         self,
         query: str,
@@ -83,11 +100,13 @@ class ZoteroClient:
             raw = self._zot.items(**kwargs)
         return [self._to_item(r) for r in raw]
 
+    @_with_lock
     def get_item(self, key: str) -> Item:
         raw = self._zot.item(key)
         return self._to_item(raw)
 
     def get_items_batch(self, keys: list[str]) -> list[Item]:
+        """Fetch multiple items by key. Calls get_item internally (already locked)."""
         items: list[Item] = []
         for k in keys:
             try:
@@ -96,9 +115,11 @@ class ZoteroClient:
                 continue
         return items
 
+    @_with_lock
     def get_collections(self) -> list[dict]:
         return self._zot.collections()
 
+    @_with_lock
     def get_collection_items(
         self,
         collection_key: str,
@@ -108,9 +129,11 @@ class ZoteroClient:
         raw = self._zot.collection_items(collection_key, limit=limit, itemType=item_type)
         return [self._to_item(r) for r in raw]
 
+    @_with_lock
     def get_item_children(self, key: str) -> list[dict]:
         return self._zot.children(key)
 
+    @_with_lock
     def get_recent(self, limit: int = 10) -> list[Item]:
         raw = self._zot.items(
             sort="dateAdded",
@@ -120,6 +143,7 @@ class ZoteroClient:
         )
         return [self._to_item(r) for r in raw]
 
+    @_with_lock
     def get_tags(self) -> list[str]:
         raw = self._zot.tags()
         out: list[str] = []
@@ -130,6 +154,7 @@ class ZoteroClient:
                 out.append(str(t))
         return out
 
+    @_with_lock
     def get_all_items_minimal(
         self,
         limit: int = 500,
@@ -139,6 +164,7 @@ class ZoteroClient:
         raw = self._zot.items(limit=limit, itemType=item_type)
         return [self._to_item(r) for r in raw]
 
+    @_with_lock
     def get_item_versions(
         self,
         item_type: str = "-attachment || note",
@@ -150,6 +176,7 @@ class ZoteroClient:
             items = self.get_all_items_minimal(limit=5000, item_type=item_type)
             return {it.key: it.version for it in items}
 
+    @_with_lock
     def get_pdf_paths_for_keys(
         self,
         item_keys: list[str],
@@ -183,6 +210,7 @@ class ZoteroClient:
 
     # ── Read: annotations ─────────────────────────────────────
 
+    @_with_lock
     def get_annotations(self, item_key: str) -> list[Annotation]:
         """Return user annotations on a paper's PDF attachments (highlights, notes, etc.)."""
         annotations: list[Annotation] = []
@@ -214,28 +242,58 @@ class ZoteroClient:
                 )
         return annotations
 
+    @_with_lock
     def search_all_annotations(self, query: str, limit: int = 20) -> list[dict]:
-        """Search annotations across ALL papers in the library by keyword."""
+        """Search annotations across ALL papers in the library by keyword.
+
+        Paginates through the entire library (100 items per page) instead of
+        using a hard cap, but stops as soon as `limit` matches are found.
+        """
         query_lower = query.lower()
         results: list[dict] = []
-        for raw in self._zot.items(itemType="-attachment || note", limit=500):
-            item = self._to_item(raw)
-            anns = self.get_annotations(item.key)
-            for a in anns:
-                text_combined = f"{a.text} {a.comment}".lower()
-                if query_lower in text_combined:
-                    results.append({
-                        "item_key": item.key,
-                        "title": item.title,
-                        "annotation_key": a.key,
-                        "type": a.annotation_type,
-                        "text": a.text,
-                        "comment": a.comment,
-                        "page": a.page,
-                        "color": a.color,
-                    })
-                    if len(results) >= limit:
-                        return results
+        page_size = 100
+        start = 0
+        while True:
+            batch = self._zot.items(
+                itemType="-attachment || note", limit=page_size, start=start,
+            )
+            if not batch:
+                break
+            for raw in batch:
+                item = self._to_item(raw)
+                for ch in self._zot.children(item.key):
+                    ch_data = ch.get("data", ch)
+                    if ch_data.get("contentType") != "application/pdf":
+                        continue
+                    try:
+                        anns = self._zot.children(ch_data.get("key", ""))
+                    except Exception:
+                        continue
+                    for a in anns:
+                        d = a.get("data", a)
+                        if d.get("itemType") != "annotation":
+                            continue
+                        text_combined = f"{d.get('annotationText', '')} {d.get('annotationComment', '')}".lower()
+                        if query_lower in text_combined:
+                            page_label = d.get("annotationPageLabel", "")
+                            page: int | None = None
+                            if page_label and page_label.isdigit():
+                                page = int(page_label)
+                            results.append({
+                                "item_key": item.key,
+                                "title": item.title,
+                                "annotation_key": d.get("key", ""),
+                                "type": d.get("annotationType", "highlight"),
+                                "text": d.get("annotationText", ""),
+                                "comment": d.get("annotationComment", ""),
+                                "page": page,
+                                "color": d.get("annotationColor", ""),
+                            })
+                            if len(results) >= limit:
+                                return results
+            if len(batch) < page_size:
+                break
+            start += page_size
         return results
 
     # ── Read: attachments ─────────────────────────────────────
@@ -254,6 +312,7 @@ class ZoteroClient:
             pass
         return None
 
+    @_with_lock
     def get_pdf_items_with_paths(
         self,
         limit: int = 500,
@@ -282,6 +341,7 @@ class ZoteroClient:
 
     # ── Read: BibTeX export ──────────────────────────────────
 
+    @_with_lock
     def get_bibtex(self, item_keys: list[str]) -> dict[str, str]:
         """Return {item_key: bibtex_entry}. Uses Better BibTeX format when available."""
         out: dict[str, str] = {}
@@ -322,6 +382,7 @@ class ZoteroClient:
 
     # ── Write: notes & tags ──────────────────────────────────
 
+    @_with_lock
     def create_note(
         self,
         parent_item_key: str,
@@ -337,6 +398,7 @@ class ZoteroClient:
             template["tags"] = [{"tag": t} for t in tags]
         return w.create_items([template])
 
+    @_with_lock
     def update_item_tags(
         self,
         item_key: str,
@@ -362,16 +424,19 @@ class ZoteroClient:
 
     # ── Write: create items ──────────────────────────────────
 
+    @_with_lock
     def create_item(self, item_data: dict) -> dict:
         """Create a new top-level item in Zotero. Returns the API response."""
         return self._writer.create_items([item_data])
 
+    @_with_lock
     def attach_file(self, parent_key: str, filepath: str) -> dict:
         """Upload a file as a child attachment of an existing item."""
         return self._writer.attachment_simple([filepath], parent_key)
 
     # ── Write: collections ───────────────────────────────────
 
+    @_with_lock
     def create_collection(self, name: str, parent_key: str = "") -> dict:
         """Create a new collection. Returns the API response."""
         payload: dict = {"name": name}
@@ -379,6 +444,7 @@ class ZoteroClient:
             payload["parentCollection"] = parent_key
         return self._writer.create_collections([payload])
 
+    @_with_lock
     def add_to_collection(self, collection_key: str, item_keys: list[str]) -> list[dict]:
         """Add items to a collection by updating each item's collections list."""
         results: list[dict] = []
@@ -396,6 +462,7 @@ class ZoteroClient:
             results.append({"item_key": key, "status": "added"})
         return results
 
+    @_with_lock
     def remove_from_collection(self, collection_key: str, item_keys: list[str]) -> list[dict]:
         """Remove items from a collection."""
         results: list[dict] = []
@@ -413,6 +480,7 @@ class ZoteroClient:
             results.append({"item_key": key, "status": "removed"})
         return results
 
+    @_with_lock
     def search_collections(self, query: str) -> list[dict]:
         """Search collections by name (case-insensitive substring match)."""
         query_lower = query.lower()
@@ -430,6 +498,7 @@ class ZoteroClient:
 
     # ── Duplicate detection ──────────────────────────────────
 
+    @_with_lock
     def find_duplicates(self, limit: int = 500) -> list[list[dict]]:
         """Find duplicate items by normalized title and/or DOI match.
 
@@ -472,6 +541,144 @@ class ZoteroClient:
         t = unicodedata.normalize("NFKD", title.lower())
         t = "".join(c for c in t if not unicodedata.combining(c))
         return re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", t)
+
+    # ── Write: annotations ─────────────────────────────────
+
+    @_with_lock
+    def create_annotation(
+        self,
+        attachment_key: str,
+        page: int,
+        text: str,
+        comment: str = "",
+        color: str = "#ffd400",
+        tags: list[str] | None = None,
+    ) -> dict:
+        """Create a highlight annotation on a PDF attachment.
+
+        Args:
+            attachment_key: Key of the PDF attachment (not the parent item).
+            page: 0-based page index where the annotation is placed.
+            text: The highlighted text.
+            comment: Optional comment on the highlight.
+            color: Hex color for the highlight (default yellow).
+            tags: Optional tags for the annotation.
+
+        Returns the created annotation data from Zotero API.
+        """
+        w = self._writer
+        annotation_data = {
+            "itemType": "annotation",
+            "parentItem": attachment_key,
+            "annotationType": "highlight",
+            "annotationText": text,
+            "annotationComment": comment,
+            "annotationColor": color,
+            "annotationPageLabel": str(page + 1),
+            "annotationSortIndex": f"{page:05d}|000000|00000",
+            "annotationPosition": "{}",
+            "tags": [{"tag": t} for t in (tags or [])],
+        }
+        return w.create_items([annotation_data])
+
+    def get_pdf_attachment_key(self, item_key: str) -> str | None:
+        """Find the first PDF attachment key for a parent item."""
+        for ch in self._zot.children(item_key):
+            ch_data = ch.get("data", ch)
+            if ch_data.get("contentType") == "application/pdf":
+                return ch_data.get("key", "")
+        return None
+
+    # ── Write: merge duplicates ────────────────────────────
+
+    @_with_lock
+    def merge_items(
+        self,
+        keeper_key: str,
+        duplicate_keys: list[str],
+    ) -> dict:
+        """Merge duplicates into keeper: combine tags, collections, re-parent children, trash dups.
+
+        Returns a summary dict with merged tags, collections, children counts.
+        """
+        w = self._writer
+        keeper_raw = w.item(keeper_key)
+        keeper_data = keeper_raw.get("data", {})
+
+        keeper_tags = {t.get("tag", "") for t in keeper_data.get("tags", [])}
+        keeper_cols = set(keeper_data.get("collections", []))
+        keeper_children = w.children(keeper_key)
+        keeper_att_sigs = set()
+        for ch in keeper_children:
+            cd = ch.get("data", ch)
+            sig = (
+                cd.get("contentType", ""),
+                cd.get("filename", ""),
+                cd.get("md5", ""),
+            )
+            keeper_att_sigs.add(sig)
+
+        merged_tags: list[str] = []
+        merged_collections: list[str] = []
+        reparented = 0
+        skipped_attachments = 0
+
+        for dup_key in duplicate_keys:
+            dup_raw = w.item(dup_key)
+            dup_data = dup_raw.get("data", {})
+
+            for t in dup_data.get("tags", []):
+                tag = t.get("tag", "")
+                if tag and tag not in keeper_tags:
+                    keeper_tags.add(tag)
+                    merged_tags.append(tag)
+
+            for col in dup_data.get("collections", []):
+                if col not in keeper_cols:
+                    keeper_cols.add(col)
+                    merged_collections.append(col)
+
+            for ch in w.children(dup_key):
+                cd = ch.get("data", ch)
+                sig = (
+                    cd.get("contentType", ""),
+                    cd.get("filename", ""),
+                    cd.get("md5", ""),
+                )
+                if sig in keeper_att_sigs and cd.get("itemType") == "attachment":
+                    skipped_attachments += 1
+                    continue
+                cd["parentItem"] = keeper_key
+                try:
+                    w.update_item(ch)
+                    reparented += 1
+                    keeper_att_sigs.add(sig)
+                except Exception:
+                    pass
+
+        keeper_raw = w.item(keeper_key)
+        keeper_data = keeper_raw.get("data", {})
+        keeper_data["tags"] = [{"tag": t} for t in sorted(keeper_tags) if t]
+        keeper_data["collections"] = sorted(keeper_cols)
+        w.update_item(keeper_raw)
+
+        for dup_key in duplicate_keys:
+            try:
+                dup_raw = w.item(dup_key)
+                dup_data = dup_raw.get("data", {})
+                dup_data["deleted"] = 1
+                w.update_item(dup_raw)
+            except Exception:
+                pass
+
+        return {
+            "keeper_key": keeper_key,
+            "merged_tags": merged_tags,
+            "merged_collections": merged_collections,
+            "reparented_children": reparented,
+            "skipped_duplicate_attachments": skipped_attachments,
+            "trashed_duplicates": duplicate_keys,
+        }
 
     # ── Internal ─────────────────────────────────────────────
 

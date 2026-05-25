@@ -97,6 +97,10 @@ def search_papers(
     for item in zot.get_items_batch(missing):
         items_by_key[item.key] = item
 
+    tags_incl_set = set(tags_include) if tags_include else set()
+    tags_excl_set = set(tags_exclude) if tags_exclude else set()
+    collection_filter = collection_key.strip() if collection_key else ""
+
     hits: list[PaperHit] = []
     for score, key in scored:
         item = items_by_key.get(key)
@@ -108,6 +112,13 @@ def search_papers(
         if year_from and year < year_from:
             continue
         if year_to and year > year_to:
+            continue
+        item_tags = set(item.tags)
+        if tags_incl_set and not tags_incl_set.issubset(item_tags):
+            continue
+        if tags_excl_set and tags_excl_set & item_tags:
+            continue
+        if collection_filter and collection_filter not in item.collections:
             continue
         passage, page = semantic_best_passage.get(key, ("", 0))
         src = (
@@ -131,6 +142,42 @@ def search_papers(
         )
         if len(hits) >= limit:
             break
+
+    if not hits and query.strip():
+        fallback_items = zot.search_items(
+            query=query, limit=limit * 2, qmode="everything",
+            tag=tag_filter or None, collection_key=collection_key,
+        )
+        for item in fallback_items:
+            year = ZoteroClient.parse_year(item.date)
+            if (year_from or year_to) and year == 0:
+                continue
+            if year_from and year < year_from:
+                continue
+            if year_to and year > year_to:
+                continue
+            fb_tags = set(item.tags)
+            if tags_incl_set and not tags_incl_set.issubset(fb_tags):
+                continue
+            if tags_excl_set and tags_excl_set & fb_tags:
+                continue
+            if collection_filter and collection_filter not in item.collections:
+                continue
+            hits.append(
+                PaperHit(
+                    key=item.key,
+                    title=item.title,
+                    authors=item.authors,
+                    year=year,
+                    doi=item.doi,
+                    tags=item.tags,
+                    score=0.0,
+                    source="fallback",
+                )
+            )
+            if len(hits) >= limit:
+                break
+
     return hits
 
 
@@ -300,3 +347,73 @@ def find_duplicates(zot: ZoteroClient) -> list[DuplicateGroup]:
         reason = "doi_match" if dois else "title_match"
         groups.append(DuplicateGroup(items=group, match_reason=reason))
     return groups
+
+
+@dataclass
+class MergeResult:
+    """Result of a duplicate merge operation."""
+
+    confirmed: bool
+    preview: dict
+    result: dict | None = None
+    error: str = ""
+
+
+def merge_duplicates(
+    keeper_key: str,
+    duplicate_keys: list[str],
+    zot: ZoteroClient,
+    confirm: bool = False,
+) -> MergeResult:
+    """Merge duplicate items into a keeper. Defaults to dry-run preview.
+
+    Merges tags, collections, and re-parents children from duplicates into the
+    keeper item. Duplicate attachments (by contentType+filename+md5) are skipped.
+    Duplicates are moved to trash (not permanently deleted).
+    """
+    if not keeper_key or not duplicate_keys:
+        return MergeResult(
+            confirmed=False, preview={},
+            error="Both keeper_key and duplicate_keys are required.",
+        )
+
+    preview = {
+        "action": "merge_duplicates",
+        "keeper_key": keeper_key,
+        "duplicate_keys": duplicate_keys,
+        "count": len(duplicate_keys),
+    }
+
+    if not confirm:
+        try:
+            keeper = zot.get_item(keeper_key)
+            preview["keeper_title"] = keeper.title
+            dup_titles = []
+            for dk in duplicate_keys:
+                try:
+                    d = zot.get_item(dk)
+                    dup_titles.append({"key": dk, "title": d.title})
+                except Exception:
+                    dup_titles.append({"key": dk, "title": "(not found)"})
+            preview["duplicates"] = dup_titles
+        except Exception as e:
+            return MergeResult(confirmed=False, preview=preview, error=str(e))
+        preview["next_step"] = "Call again with confirm=true to execute the merge."
+        if not zot.can_write:
+            preview["warning"] = (
+                "Write operations are not available. To enable writes, add "
+                "ZOTERO_API_KEY and ZOTERO_LIBRARY_ID to your .env file."
+            )
+        return MergeResult(confirmed=False, preview=preview)
+
+    if not zot.can_write:
+        return MergeResult(
+            confirmed=False, preview=preview,
+            error="Write operations are not available.",
+        )
+
+    try:
+        result = zot.merge_items(keeper_key, duplicate_keys)
+        return MergeResult(confirmed=True, preview=preview, result=result)
+    except Exception as e:
+        return MergeResult(confirmed=False, preview=preview, error=str(e))

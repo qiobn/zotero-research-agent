@@ -132,30 +132,32 @@ project/
 
 - [x] **2.1 MCP tool surface 设计与实现** ✅
 
-  **13 个工具，5 个意图类别，零功能重叠：**
+  **16 个工具，5 个意图类别，零功能重叠：**
 
   | 类别 | 工具名 | 意图（一句话） |
   |---|---|---|
-  | DISCOVER | `search_papers` | 按主题/关键词/过滤找论文（hybrid: keyword + semantic，RRF 合并，cross-encoder 重排） |
+  | DISCOVER | `search_papers` | 按主题/关键词/过滤找论文（hybrid: keyword + semantic，RRF 合并，cross-encoder 重排，自动回退到全文索引） |
   | DISCOVER | `find_similar_papers` | 给定一篇论文，找库里概念相似的论文（title+abstract 作 query） |
   | DISCOVER | `browse_library` | 浏览库结构（scope = collections / tags / recent / collection_items）|
   | DISCOVER | `find_duplicates` | 查找库中重复论文（DOI 或归一化标题匹配） |
+  | DISCOVER | `merge_duplicates` | 合并重复论文到一个 keeper（合并 tags/collections/children，去重附件，垃圾桶删除） |
   | READ | `get_paper` | 单篇论文的元数据 + 摘要 |
-  | READ | `get_paper_content` | 读一篇论文内部的段落（query / page / 默认 + 可选 include_annotations） |
-  | READ | `search_annotations` | 跨论文搜索用户的高亮和批注 |
-  | WRITE | `suggest_citations` | 为用户草稿段落推荐引用（按论文去重，附 evidence + page） |
+  | READ | `get_paper_content` | 读论文内容，5 种模式：fulltext / outline / query / page / 默认，可选 include_annotations |
+  | READ | `search_annotations` | 跨论文搜索用户的高亮和批注（分页扫描全库，无上限） |
+  | READ | `create_annotation` | 在论文 PDF 上创建高亮注释（自动解析附件 key，dry-run + confirm） |
+  | WRITE | `suggest_citations` | 为用户草稿推荐引用（多句拆分独立检索，更多样化的结果） |
   | WRITE | `export_bibliography` | 导出指定论文的 BibTeX / 引文格式 |
-  | WRITE | `add_paper` | 通过 DOI / arXiv ID / URL 添加论文（CrossRef/arXiv 拉元数据，4 级 PDF 瀑布下载） |
-  | MANAGE | `add_note` | 给论文加笔记（dry-run + confirm） |
+  | WRITE | `add_paper` | 通过 DOI / arXiv / ISBN / BibTeX / URL 添加论文（5 种格式，4 级 PDF 瀑布下载） |
+  | MANAGE | `add_note` | 给论文加笔记（HTML 转义 + dry-run + confirm） |
   | MANAGE | `edit_tags` | 批量加/删标签（dry-run + confirm） |
   | MANAGE | `manage_collections` | 创建集合、添加/移除论文到集合（dry-run + confirm） |
-  | ADMIN | `sync_index` | 同步向量库与 Zotero 库（增量版本跟踪 / force_rebuild） |
+  | ADMIN | `sync_index` | 同步向量库（增量版本跟踪 + 启动时后台自动同步） |
 
   设计原则：
   - 工具名 = 动词 + 名词
   - description 明示「什么时候用、什么时候**不要**用」
   - 工具间通过 `item_key` 串联，形成 discover → read → cite → manage 链
-  - 13 个工具处于 10-20 安全区内，不超过 LLM 选择阈值
+  - 16 个工具在 LLM 工具选择的安全范围内
 
 - [x] **2.2 写操作安全（Hybrid 模式）** ✅
   - 所有写操作（`add_note` / `edit_tags` / `manage_collections` / `add_paper`）默认 `confirm=False`，先返回 diff 预览
@@ -172,12 +174,18 @@ project/
   - **增量索引**：基于 Zotero item version 跟踪，只处理新增/修改/删除的论文；自动检测嵌入模型变更触发全量重建
   - **PDF 下载 4 级瀑布**：arXiv → Unpaywall → Semantic Scholar → PMC
 
-- [x] **2.5 文档与配置** ✅
-  - `docs/cherry-studio-setup.md`：面向实验室成员的 Cherry Studio 配置指南
-  - `.env.example`：完整环境变量模板（Zotero / Embedding / Reranker / ChromaDB）
-  - 30 个集成测试覆盖全部 13 个工具
+- [x] **2.5 健壮性与工程质量** ✅
+  - `normalize_list()` 输入规范化：统一处理 LLM 发来的 JSON 字符串、逗号分隔、tag dict 等格式
+  - `_with_lock` (RLock) 并发保护：所有 Zotero API 调用线程安全
+  - `_safe_tool` 全局异常捕获：返回 `{error, tool}` 而非 traceback
+  - HTML 转义：`add_note` 中 title 做 `html.escape()` 防止 XSS
 
-- [ ] **2.6 部署与分发**（下一步）
+- [x] **2.6 文档与配置** ✅
+  - `docs/cherry-studio-setup.md`：面向实验室成员的 Cherry Studio 配置指南
+  - `.env.example`：完整环境变量模板（Zotero / Embedding / Reranker / ChromaDB / Auto-sync）
+  - 集成测试覆盖全部 16 个工具
+
+- [ ] **2.7 部署与分发**（下一步）
   - 编写 `Dockerfile` + `docker-compose.yml`
   - 部署到实验室服务器（SSE / streamable-http 对外）
   - 做一次 30 分钟培训

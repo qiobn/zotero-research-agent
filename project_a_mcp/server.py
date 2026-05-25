@@ -1,10 +1,10 @@
 """Zotero Research Assistant — MCP server.
 
-Thirteen tools, one intent each, designed to compose via `item_key`.
+16 tools, one intent each, designed to compose via `item_key`.
 
 Categories:
-  DISCOVER   search_papers, find_similar_papers, browse_library, find_duplicates
-  READ       get_paper, get_paper_content, search_annotations
+  DISCOVER   search_papers, find_similar_papers, browse_library, find_duplicates, merge_duplicates
+  READ       get_paper, get_paper_content, search_annotations, create_annotation
   WRITE      suggest_citations, export_bibliography, add_paper
   MANAGE     add_note, edit_tags, manage_collections
   ADMIN      sync_index
@@ -13,10 +13,16 @@ Categories:
 from __future__ import annotations
 
 import os
+import threading
+import traceback
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from functools import wraps
 from typing import Literal
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from loguru import logger
 from research_core.rag.indexer import Indexer
 from research_core.rag.retriever import Retriever
 from research_core.tools import (
@@ -27,6 +33,9 @@ from research_core.tools import (
 )
 from research_core.tools import (
     browse_library as _browse_library,
+)
+from research_core.tools import (
+    create_annotation as _create_annotation,
 )
 from research_core.tools import (
     edit_tags as _edit_tags,
@@ -50,6 +59,9 @@ from research_core.tools import (
     manage_collections as _manage_collections,
 )
 from research_core.tools import (
+    merge_duplicates as _merge_duplicates,
+)
+from research_core.tools import (
     search_annotations as _search_annotations,
 )
 from research_core.tools import (
@@ -61,9 +73,39 @@ from research_core.tools import (
 from research_core.tools import (
     sync_index as _sync_index,
 )
+from research_core.utils import normalize_list
 from research_core.zotero.client import ZoteroClient
 
 load_dotenv()
+
+
+def _background_sync():
+    """Run incremental sync in a background thread on server startup."""
+    try:
+        logger.info("Background sync: starting incremental index sync...")
+        report = _sync_index(
+            zot=_get_zot(),
+            indexer=_get_indexer(),
+            retriever=_get_retriever(),
+            force_rebuild=False,
+        )
+        logger.info(
+            f"Background sync complete: {len(report.added)} added, "
+            f"{len(report.updated)} updated, {len(report.skipped)} skipped, "
+            f"{len(report.failed)} failed"
+        )
+    except Exception as e:
+        logger.warning(f"Background sync failed (non-fatal): {e}")
+
+
+@asynccontextmanager
+async def _lifespan(app: FastMCP) -> AsyncIterator[None]:
+    """Server lifecycle: launch background index sync on startup."""
+    if os.getenv("ZRA_AUTO_SYNC", "true").lower() != "false":
+        t = threading.Thread(target=_background_sync, daemon=True)
+        t.start()
+    yield
+
 
 mcp = FastMCP(
     "Zotero Research Assistant",
@@ -72,7 +114,20 @@ mcp = FastMCP(
         "Tools compose via `item_key`: discovery tools return keys, read/write tools consume them. "
         "Prefer search_papers as the entry point. Never call multiple search tools for the same intent."
     ),
+    lifespan=_lifespan,
 )
+
+def _safe_tool(func):
+    """Wrap a tool function to catch all exceptions and return structured errors."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            logger.error(f"Tool {func.__name__} failed: {exc}\n{traceback.format_exc()}")
+            return {"error": str(exc), "tool": func.__name__}
+    return wrapper
+
 
 _zot: ZoteroClient | None = None
 _retriever: Retriever | None = None
@@ -111,6 +166,7 @@ def _get_indexer() -> Indexer:
 
 
 @mcp.tool()
+@_safe_tool
 def search_papers(
     query: str,
     year_from: int | None = None,
@@ -152,8 +208,8 @@ def search_papers(
         retriever=_get_retriever(),
         year_from=year_from,
         year_to=year_to,
-        tags_include=tags_include,
-        tags_exclude=tags_exclude,
+        tags_include=normalize_list(tags_include, "tags_include"),
+        tags_exclude=normalize_list(tags_exclude, "tags_exclude"),
         collection_key=collection_key,
         limit=limit,
     )
@@ -161,6 +217,7 @@ def search_papers(
 
 
 @mcp.tool()
+@_safe_tool
 def find_similar_papers(item_key: str, limit: int = 10) -> list[dict]:
     """Find papers similar to a SPECIFIC paper the user has identified.
 
@@ -185,6 +242,7 @@ def find_similar_papers(item_key: str, limit: int = 10) -> list[dict]:
 
 
 @mcp.tool()
+@_safe_tool
 def browse_library(
     scope: Literal["collections", "tags", "recent", "collection_items"],
     collection_key: str = "",
@@ -211,6 +269,7 @@ def browse_library(
 
 
 @mcp.tool()
+@_safe_tool
 def find_duplicates() -> list[dict]:
     """Find duplicate papers in the library.
 
@@ -229,12 +288,54 @@ def find_duplicates() -> list[dict]:
     return [g.__dict__ for g in groups]
 
 
+@mcp.tool()
+@_safe_tool
+def merge_duplicates(
+    keeper_key: str,
+    duplicate_keys: list[str],
+    confirm: bool = False,
+) -> dict:
+    """Merge duplicate papers into a single keeper item.
+
+    SAFETY: defaults to dry-run. First call shows what will be merged (tags,
+    collections, children to re-parent); call again with confirm=true to execute.
+
+    The merge process:
+    1. Combines tags from all duplicates into the keeper
+    2. Adds the keeper to any collections the duplicates belong to
+    3. Re-parents child items (notes, attachments) to the keeper
+       (skips duplicate attachments based on contentType+filename+md5)
+    4. Moves duplicate items to Zotero trash (not permanent delete)
+
+    Use this AFTER find_duplicates has identified duplicate groups.
+
+    When NOT to use:
+    - Duplicates haven't been identified yet → use find_duplicates first.
+
+    Args:
+        keeper_key: The item key to keep (the "primary" copy).
+        duplicate_keys: List of item keys to merge into keeper and trash.
+        confirm: Must be True to execute. Default False = preview only.
+
+    Returns:
+        {confirmed, preview, result, error}.
+    """
+    res = _merge_duplicates(
+        keeper_key=keeper_key,
+        duplicate_keys=normalize_list(duplicate_keys, "duplicate_keys"),
+        zot=_get_zot(),
+        confirm=confirm,
+    )
+    return res.__dict__
+
+
 # ╔══════════════════════════════════════════════════════════════╗
 # ║  READ                                                        ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 
 @mcp.tool()
+@_safe_tool
 def get_paper(item_key: str) -> dict:
     """Get metadata + abstract of ONE specific paper.
 
@@ -258,24 +359,30 @@ def get_paper(item_key: str) -> dict:
 
 
 @mcp.tool()
+@_safe_tool
 def get_paper_content(
     item_key: str,
     query: str = "",
     page: int | None = None,
     include_annotations: bool = False,
+    mode: Literal["", "fulltext", "outline"] = "",
     limit: int = 5,
 ) -> dict:
     """Read content INSIDE a specific paper.
 
-    Use this to read what a paper actually says. Three modes (mutually exclusive):
-      1. `query` provided → returns the top passages semantically matching the query,
+    Use this to read what a paper actually says. Five modes:
+      1. `mode='fulltext'` → return the COMPLETE paper text (up to 50 pages,
+         paginated). Best for "show me the whole paper" or reading long sections.
+      2. `mode='outline'` → return the PDF table of contents (headings + page
+         numbers). Best for "what's the structure of this paper?".
+      3. `query` provided → returns the top passages semantically matching the query,
          restricted to this paper only. Best for "What does paper X say about Y?".
-      2. `page` provided → returns all chunks that intersect that page number. Best
+      4. `page` provided → returns all chunks that intersect that page number. Best
          for "What is on page N of paper X?".
-      3. Neither → returns the first `limit` chunks (paper opening / intro).
+      5. Neither → returns the first `limit` chunks (paper opening / intro).
 
     Set `include_annotations=True` to additionally return the user's OWN highlights
-    and comments on this paper. Useful for "What did I highlight in this paper?".
+    and comments on this paper. Works with any mode.
 
     When NOT to use:
     - User wants to find papers across the library → use search_papers.
@@ -284,14 +391,14 @@ def get_paper_content(
 
     Args:
         item_key: The paper to read from. Required.
-        query: Topic words to search for inside this paper (mode 1).
-        page: Specific page number (mode 2).
+        mode: "" (default), "fulltext", or "outline".
+        query: Topic words to search for inside this paper (mode 3).
+        page: Specific page number (mode 4).
         include_annotations: If True, also fetch user highlights/notes.
         limit: Max number of passages to return.
 
     Returns:
-        {item_key, title, passages: [{text, page_start, page_end, score}],
-         annotations: [{type, text, comment, page, color}] (if requested)}.
+        {item_key, title, passages, annotations, outline, fulltext}.
     """
     content = _get_paper_content(
         item_key=item_key,
@@ -300,12 +407,14 @@ def get_paper_content(
         query=query,
         page=page,
         include_annotations=include_annotations,
+        mode=mode,
         limit=limit,
     )
     return content.__dict__
 
 
 @mcp.tool()
+@_safe_tool
 def search_annotations(query: str, limit: int = 20) -> list[dict]:
     """Search highlights and comments across ALL papers in the library.
 
@@ -328,12 +437,64 @@ def search_annotations(query: str, limit: int = 20) -> list[dict]:
     return _search_annotations(query, _get_zot(), limit=limit)
 
 
+@mcp.tool()
+@_safe_tool
+def create_annotation(
+    item_key: str,
+    text: str,
+    page: int = 0,
+    comment: str = "",
+    color: str = "#ffd400",
+    tags: list[str] | None = None,
+    confirm: bool = False,
+) -> dict:
+    """Create a highlight annotation on a paper's PDF.
+
+    SAFETY: defaults to dry-run. First call shows a preview of the annotation
+    to be created; call again with confirm=true to save it.
+
+    Automatically resolves the parent item key to its PDF attachment — the user
+    only needs to provide the paper's item_key, not the attachment key.
+
+    Use this when the user asks to highlight text, annotate a passage, or mark
+    a section of a paper.
+
+    When NOT to use:
+    - User wants to write a reading note → use add_note.
+    - User wants to search existing annotations → use search_annotations.
+
+    Args:
+        item_key: The paper's item key (parent item, not the attachment).
+        text: The text to highlight in the PDF.
+        page: 0-based page index (default 0 = first page).
+        comment: Optional comment attached to the highlight.
+        color: Hex color for the highlight (default #ffd400 = yellow).
+        tags: Optional tags for the annotation.
+        confirm: Must be True to create. Default False = preview only.
+
+    Returns:
+        {confirmed, preview, result, error}.
+    """
+    res = _create_annotation(
+        item_key=item_key,
+        text=text,
+        zot=_get_zot(),
+        page=page,
+        comment=comment,
+        color=color,
+        tags=normalize_list(tags, "tags") or None,
+        confirm=confirm,
+    )
+    return res.__dict__
+
+
 # ╔══════════════════════════════════════════════════════════════╗
 # ║  WRITE                                                       ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 
 @mcp.tool()
+@_safe_tool
 def suggest_citations(draft_text: str, top_k: int = 5) -> list[dict]:
     """For a passage from the USER'S OWN WRITING, suggest papers from their library
     that could be cited to support each claim.
@@ -363,6 +524,7 @@ def suggest_citations(draft_text: str, top_k: int = 5) -> list[dict]:
 
 
 @mcp.tool()
+@_safe_tool
 def export_bibliography(
     item_keys: list[str],
     format: Literal["bibtex", "citation"] = "bibtex",
@@ -384,34 +546,38 @@ def export_bibliography(
     Returns:
         {format, entries: {key: text}, combined_text: <all entries joined>}.
     """
-    bib = _export_bibliography(item_keys, _get_zot(), fmt=format)
+    bib = _export_bibliography(normalize_list(item_keys, "item_keys"), _get_zot(), fmt=format)
     return bib.__dict__
 
 
 @mcp.tool()
+@_safe_tool
 def add_paper(
     identifier: str,
     collection_key: str = "",
     tags: list[str] | None = None,
     confirm: bool = False,
 ) -> dict:
-    """Add a NEW paper to the Zotero library by DOI, arXiv ID, or URL.
+    """Add a NEW paper to the Zotero library by DOI, arXiv ID, ISBN, BibTeX, or URL.
 
     SAFETY: defaults to preview mode. First call fetches metadata and shows what
     would be created; only when called again with confirm=true does it actually
-    create the item. Automatically tries to download the open-access PDF from
-    Unpaywall and arXiv.
+    create the item. Automatically tries to download the open-access PDF via
+    arXiv → Unpaywall → Semantic Scholar → PMC waterfall.
 
-    Use this when the user says "add this paper", "import 10.xxxx/yyyy",
-    "add this arXiv paper", or pastes a DOI/URL.
+    Supported identifier formats:
+      - DOI: "10.1234/abcd" or "https://doi.org/10.1234/abcd"
+      - arXiv: "2301.00001" or "https://arxiv.org/abs/2301.00001"
+      - ISBN: "978-0-123456-78-9" or "0123456789"
+      - BibTeX: a full @article{...} entry string
+      - URL: any other http(s) link
 
     When NOT to use:
     - Paper is already in the library → use search_papers to verify first.
     - User wants to read or cite an existing paper → use get_paper / suggest_citations.
 
     Args:
-        identifier: DOI (e.g. "10.1234/abcd"), arXiv ID ("2301.00001"),
-                    or URL (https://arxiv.org/abs/..., https://doi.org/...).
+        identifier: DOI, arXiv ID, ISBN, BibTeX string, or URL.
         collection_key: Optional collection to add the paper to.
         tags: Optional tags to apply to the new paper.
         confirm: Must be True to actually create. Default False = preview only.
@@ -423,7 +589,7 @@ def add_paper(
         identifier=identifier,
         zot=_get_zot(),
         collection_key=collection_key,
-        tags=tags,
+        tags=normalize_list(tags, "tags") or None,
         confirm=confirm,
     )
     return res.__dict__
@@ -435,6 +601,7 @@ def add_paper(
 
 
 @mcp.tool()
+@_safe_tool
 def add_note(
     item_key: str,
     title: str,
@@ -470,13 +637,14 @@ def add_note(
         title=title,
         content=content,
         zot=_get_zot(),
-        tags=tags,
+        tags=normalize_list(tags, "tags") or None,
         confirm=confirm,
     )
     return res.__dict__
 
 
 @mcp.tool()
+@_safe_tool
 def edit_tags(
     item_keys: list[str],
     add: list[str] | None = None,
@@ -506,16 +674,17 @@ def edit_tags(
         {confirmed, preview: {action, add, remove, items: [diffs]}, result}.
     """
     res = _edit_tags(
-        item_keys=item_keys,
+        item_keys=normalize_list(item_keys, "item_keys"),
         zot=_get_zot(),
-        add=add,
-        remove=remove,
+        add=normalize_list(add, "add"),
+        remove=normalize_list(remove, "remove"),
         confirm=confirm,
     )
     return res.__dict__
 
 
 @mcp.tool()
+@_safe_tool
 def manage_collections(
     action: Literal["create", "add_items", "remove_items"],
     name: str = "",
@@ -557,7 +726,7 @@ def manage_collections(
         name=name,
         parent_key=parent_key,
         collection_key=collection_key,
-        item_keys=item_keys,
+        item_keys=normalize_list(item_keys, "item_keys"),
         confirm=confirm,
     )
     return res.__dict__
@@ -569,6 +738,7 @@ def manage_collections(
 
 
 @mcp.tool()
+@_safe_tool
 def sync_index(force_rebuild: bool = False) -> dict:
     """Synchronize the vector index with the current Zotero library.
 

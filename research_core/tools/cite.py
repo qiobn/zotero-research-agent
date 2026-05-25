@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from research_core.rag.reranker import get_reranker
-from research_core.rag.retriever import Retriever
+from research_core.rag.retriever import RetrievalResult, Retriever
 from research_core.zotero.client import ZoteroClient
+
+_SENTENCE_RE = re.compile(r"(?<=[.!?。！？])\s+")
 
 
 @dataclass
@@ -27,6 +30,19 @@ class BibliographyExport:
     combined_text: str
 
 
+def _search_single(
+    text: str, retriever: Retriever, n_results: int,
+) -> list[RetrievalResult]:
+    """Run a single retrieval + optional rerank pass."""
+    raw = retriever.search(text, n_results=n_results)
+    reranker = get_reranker()
+    if reranker and raw:
+        docs = [r.text for r in raw]
+        reranked = reranker.rerank(text, docs, top_k=max(n_results // 2, 10))
+        raw = [raw[idx] for idx, _ in reranked]
+    return raw
+
+
 def suggest_citations(
     draft_text: str,
     retriever: Retriever,
@@ -35,22 +51,31 @@ def suggest_citations(
 ) -> list[CitationSuggestion]:
     """For a passage of the user's writing, find library papers that support the claims.
 
-    Returns at most one suggestion per paper (best matching chunk), enriched with
-    author and year so the LLM can render inline citations directly.
+    Multi-sentence drafts are split into individual claims, each searched
+    independently, then results are merged to produce more diverse citations.
+    Returns at most one suggestion per paper (best matching chunk).
     """
-    raw = retriever.search(draft_text, n_results=max(top_k * 20, 100))
+    sentences = [s.strip() for s in _SENTENCE_RE.split(draft_text) if s.strip()]
+    if len(sentences) <= 1:
+        sentences = [draft_text]
 
-    reranker = get_reranker()
-    if reranker and raw:
-        docs = [r.text for r in raw]
-        reranked = reranker.rerank(draft_text, docs, top_k=top_k * 10)
-        raw = [raw[idx] for idx, _ in reranked]
+    best_per_paper: dict[str, RetrievalResult] = {}
 
-    best_per_paper: dict[str, object] = {}
-    for r in raw:
-        existing = best_per_paper.get(r.item_key)
-        if existing is None or r.score > existing.score:
-            best_per_paper[r.item_key] = r
+    if len(sentences) == 1:
+        for r in _search_single(draft_text, retriever, max(top_k * 20, 100)):
+            existing = best_per_paper.get(r.item_key)
+            if existing is None or r.score > existing.score:
+                best_per_paper[r.item_key] = r
+    else:
+        per_sentence = max(top_k * 6, 30)
+        for sentence in sentences:
+            if len(sentence) < 10:
+                continue
+            for r in _search_single(sentence, retriever, per_sentence):
+                existing = best_per_paper.get(r.item_key)
+                if existing is None or r.score > existing.score:
+                    best_per_paper[r.item_key] = r
+
     ordered = sorted(best_per_paper.values(), key=lambda r: r.score, reverse=True)[:top_k]
 
     items = zot.get_items_batch([r.item_key for r in ordered])

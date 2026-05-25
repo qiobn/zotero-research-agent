@@ -19,19 +19,29 @@ from research_core.tools.manage import (
     edit_tags,
     manage_collections,
 )
-from research_core.tools.read import PaperContent, get_paper, get_paper_content, search_annotations
+from research_core.tools.read import (
+    AnnotationResult,
+    PaperContent,
+    create_annotation,
+    get_paper,
+    get_paper_content,
+    search_annotations,
+)
 from research_core.tools.search import (
     BrowseResult,
     DuplicateGroup,
+    MergeResult,
     PaperHit,
     browse_library,
     find_duplicates,
     find_similar_papers,
+    merge_duplicates,
     search_papers,
 )
 
 __all__ = [
     "AddPaperResult",
+    "AnnotationResult",
     "BibliographyExport",
     "BrowseResult",
     "CitationSuggestion",
@@ -43,10 +53,13 @@ __all__ = [
     "add_note",
     "add_paper",
     "browse_library",
+    "create_annotation",
     "edit_tags",
     "export_bibliography",
     "find_duplicates",
     "find_similar_papers",
+    "merge_duplicates",
+    "MergeResult",
     "get_paper",
     "get_paper_content",
     "manage_collections",

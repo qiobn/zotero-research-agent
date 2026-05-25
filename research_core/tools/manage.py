@@ -13,6 +13,7 @@ from pathlib import Path
 import httpx
 from loguru import logger
 
+from research_core.utils import escape_html
 from research_core.zotero.client import ZoteroClient
 
 _WRITE_DISABLED_MSG = (
@@ -42,7 +43,7 @@ def add_note(
     confirm: bool = False,
 ) -> WriteResult:
     """Attach a note to a paper. Returns a preview unless confirm=True."""
-    note_html = f"<h1>{title}</h1>\n{content}" if title else content
+    note_html = f"<h1>{escape_html(title)}</h1>\n{content}" if title else content
     preview = {
         "action": "create_note",
         "parent_item_key": item_key,
@@ -211,6 +212,7 @@ def manage_collections(
 
 _DOI_RE = re.compile(r"10\.\d{4,}/[^\s]+")
 _ARXIV_RE = re.compile(r"(?:arxiv\.org/abs/|arxiv:)(\d{4}\.\d{4,}(?:v\d+)?)", re.IGNORECASE)
+_ISBN_RE = re.compile(r"(?:ISBN[:\s-]*)?(\d{13}|\d{9}[\dXx])", re.IGNORECASE)
 
 
 @dataclass
@@ -225,14 +227,19 @@ class AddPaperResult:
 
 
 def _parse_identifier(identifier: str) -> tuple[str, str]:
-    """Parse identifier into (type, value). Types: 'doi', 'arxiv', 'url'."""
+    """Parse identifier into (type, value). Types: 'doi', 'arxiv', 'isbn', 'bibtex', 'url'."""
     identifier = identifier.strip()
+    if identifier.startswith("@") or identifier.startswith("{"):
+        return "bibtex", identifier
     arxiv_match = _ARXIV_RE.search(identifier)
     if arxiv_match:
         return "arxiv", arxiv_match.group(1)
     doi_match = _DOI_RE.search(identifier)
     if doi_match:
         return "doi", doi_match.group(0).rstrip(".")
+    isbn_match = _ISBN_RE.search(identifier)
+    if isbn_match:
+        return "isbn", isbn_match.group(1).replace("-", "")
     if identifier.startswith("http"):
         return "url", identifier
     return "doi", identifier
@@ -314,6 +321,98 @@ def _fetch_metadata_arxiv(arxiv_id: str) -> dict | None:
     except Exception as e:
         logger.debug(f"arXiv lookup failed for {arxiv_id}: {e}")
         return None
+
+
+def _fetch_metadata_isbn(isbn: str) -> dict | None:
+    """Fetch metadata from Open Library by ISBN."""
+    try:
+        r = httpx.get(
+            f"https://openlibrary.org/isbn/{isbn}.json",
+            follow_redirects=True,
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        title = data.get("title", "")
+        authors = []
+        for a in data.get("authors", []):
+            author_key = a.get("key", "")
+            if author_key:
+                try:
+                    ar = httpx.get(
+                        f"https://openlibrary.org{author_key}.json",
+                        timeout=10,
+                    )
+                    if ar.status_code == 200:
+                        authors.append(ar.json().get("name", ""))
+                except Exception:
+                    pass
+        publish_date = data.get("publish_date", "")
+        year_match = re.search(r"\d{4}", publish_date)
+        year = year_match.group(0) if year_match else ""
+        return {
+            "itemType": "book",
+            "title": title,
+            "creators": [{"creatorType": "author", "name": n} for n in authors if n],
+            "date": year,
+            "ISBN": isbn,
+            "publisher": (data.get("publishers", [""]) or [""])[0] if isinstance(data.get("publishers"), list) else "",
+            "numPages": str(data.get("number_of_pages", "")),
+        }
+    except Exception as e:
+        logger.debug(f"ISBN lookup failed for {isbn}: {e}")
+        return None
+
+
+def _parse_bibtex(bibtex_str: str) -> dict | None:
+    """Parse a single BibTeX entry into Zotero item metadata."""
+    bibtex_str = bibtex_str.strip()
+    type_match = re.match(r"@(\w+)\s*\{", bibtex_str)
+    if not type_match:
+        return None
+
+    bib_type = type_match.group(1).lower()
+    type_map = {
+        "article": "journalArticle",
+        "inproceedings": "conferencePaper",
+        "conference": "conferencePaper",
+        "book": "book",
+        "incollection": "bookSection",
+        "phdthesis": "thesis",
+        "mastersthesis": "thesis",
+        "techreport": "report",
+        "misc": "document",
+        "unpublished": "manuscript",
+    }
+    item_type = type_map.get(bib_type, "journalArticle")
+
+    fields: dict[str, str] = {}
+    for m in re.finditer(r"(\w+)\s*=\s*[{\"](.+?)[}\"]", bibtex_str, re.DOTALL):
+        fields[m.group(1).lower()] = m.group(2).strip()
+
+    authors = []
+    if "author" in fields:
+        for name in re.split(r"\s+and\s+", fields["author"]):
+            name = name.strip().strip("{}")
+            if name:
+                authors.append(name)
+
+    metadata: dict = {
+        "itemType": item_type,
+        "title": fields.get("title", "").strip("{}"),
+        "creators": [{"creatorType": "author", "name": n} for n in authors],
+        "date": fields.get("year", ""),
+        "DOI": fields.get("doi", ""),
+        "url": fields.get("url", ""),
+        "abstractNote": fields.get("abstract", ""),
+        "publicationTitle": fields.get("journal", fields.get("booktitle", "")),
+        "volume": fields.get("volume", ""),
+        "issue": fields.get("number", ""),
+        "pages": fields.get("pages", ""),
+        "publisher": fields.get("publisher", ""),
+    }
+    return {k: v for k, v in metadata.items() if v}
 
 
 def _save_pdf_content(content: bytes) -> str | None:
@@ -452,10 +551,10 @@ def add_paper(
     tags: list[str] | None = None,
     confirm: bool = False,
 ) -> AddPaperResult:
-    """Add a paper to Zotero by DOI, arXiv ID, or URL.
+    """Add a paper to Zotero by DOI, arXiv ID, ISBN, BibTeX string, or URL.
 
-    Fetches metadata from CrossRef/arXiv, optionally downloads open-access PDF,
-    and creates the item in Zotero via the web API.
+    Fetches metadata from CrossRef/arXiv/OpenLibrary, optionally downloads
+    open-access PDF, and creates the item in Zotero via the web API.
     """
     id_type, id_value = _parse_identifier(identifier)
 
@@ -463,7 +562,13 @@ def add_paper(
     arxiv_id = ""
     doi = ""
 
-    if id_type == "arxiv":
+    if id_type == "bibtex":
+        metadata = _parse_bibtex(id_value)
+        if metadata:
+            doi = metadata.get("DOI", "")
+    elif id_type == "isbn":
+        metadata = _fetch_metadata_isbn(id_value)
+    elif id_type == "arxiv":
         arxiv_id = id_value
         metadata = _fetch_metadata_arxiv(arxiv_id)
         if metadata and metadata.get("DOI"):

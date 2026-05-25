@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import pymupdf
+from loguru import logger
+
 from research_core.rag.retriever import Retriever
 from research_core.zotero.client import ZoteroClient
 from research_core.zotero.models import Annotation, Item
@@ -17,11 +20,45 @@ class PaperContent:
     title: str
     passages: list[dict] = field(default_factory=list)
     annotations: list[dict] = field(default_factory=list)
+    outline: list[dict] = field(default_factory=list)
+    fulltext: str = ""
 
 
 def get_paper(item_key: str, zot: ZoteroClient) -> Item:
     """Return full metadata for one paper."""
     return zot.get_item(item_key)
+
+
+def _extract_outline(pdf_path: str) -> list[dict]:
+    """Extract PDF table of contents / outline via PyMuPDF."""
+    try:
+        with pymupdf.open(pdf_path) as doc:
+            toc = doc.get_toc(simple=True)
+            return [
+                {"level": level, "title": heading, "page": page_num}
+                for level, heading, page_num in toc
+            ]
+    except Exception as e:
+        logger.debug(f"Failed to extract outline: {e}")
+        return []
+
+
+def _extract_fulltext(pdf_path: str, max_pages: int = 50) -> str:
+    """Extract full text from PDF, up to max_pages."""
+    try:
+        parts: list[str] = []
+        with pymupdf.open(pdf_path) as doc:
+            for i, page in enumerate(doc):
+                if i >= max_pages:
+                    parts.append(f"\n\n[... truncated at page {max_pages}, {len(doc)} total pages ...]")
+                    break
+                text = page.get_text("text")
+                if text.strip():
+                    parts.append(f"--- Page {i + 1} ---\n{text}")
+        return "\n\n".join(parts)
+    except Exception as e:
+        logger.debug(f"Failed to extract fulltext: {e}")
+        return ""
 
 
 def get_paper_content(
@@ -31,11 +68,14 @@ def get_paper_content(
     query: str = "",
     page: int | None = None,
     include_annotations: bool = False,
+    mode: str = "",
     limit: int = 5,
 ) -> PaperContent:
     """Read content inside one paper.
 
     Mode selection:
+    - mode='fulltext' → return complete paper text (paginated, up to 50 pages)
+    - mode='outline' → return PDF table of contents / headings
     - query given → semantic search within this paper, return top-N passages
     - page given → return all chunks intersecting that page
     - neither → return the first `limit` chunks (paper opening)
@@ -46,30 +86,43 @@ def get_paper_content(
     except Exception:
         pass
 
-    passages: list[dict] = []
-    if query.strip():
-        results = retriever.search_within_item(item_key, query, n_results=limit)
-    elif page is not None:
-        results = retriever.get_item_chunks(item_key, page=page)
+    result = PaperContent(item_key=item_key, title=title)
+
+    if mode in ("fulltext", "outline"):
+        pdf_paths = zot.get_pdf_paths_for_keys([item_key])
+        pdf_path = pdf_paths.get(item_key)
+        if not pdf_path:
+            result.fulltext = "(No PDF available for this paper)"
+            return result
+        if mode == "fulltext":
+            result.fulltext = _extract_fulltext(pdf_path)
+        if mode == "outline":
+            result.outline = _extract_outline(pdf_path)
+            if not result.outline:
+                result.outline = [{"level": 0, "title": "(No outline/TOC found in this PDF)", "page": 0}]
     else:
-        all_chunks = retriever.get_item_chunks(item_key)
-        results = all_chunks[:limit]
+        if query.strip():
+            results = retriever.search_within_item(item_key, query, n_results=limit)
+        elif page is not None:
+            results = retriever.get_item_chunks(item_key, page=page)
+        else:
+            all_chunks = retriever.get_item_chunks(item_key)
+            results = all_chunks[:limit]
 
-    for r in results:
-        passages.append(
-            {
-                "text": r.text,
-                "page_start": r.page_start,
-                "page_end": r.page_end,
-                "score": round(r.score, 3) if r.score else None,
-            }
-        )
+        for r in results:
+            result.passages.append(
+                {
+                    "text": r.text,
+                    "page_start": r.page_start,
+                    "page_end": r.page_end,
+                    "score": round(r.score, 3) if r.score else None,
+                }
+            )
 
-    annotations: list[dict] = []
     if include_annotations:
         anns: list[Annotation] = zot.get_annotations(item_key)
         for a in anns:
-            annotations.append(
+            result.annotations.append(
                 {
                     "type": a.annotation_type,
                     "text": a.text,
@@ -79,12 +132,77 @@ def get_paper_content(
                 }
             )
 
-    return PaperContent(
-        item_key=item_key,
-        title=title,
-        passages=passages,
-        annotations=annotations,
-    )
+    return result
+
+
+@dataclass
+class AnnotationResult:
+    """Result of creating an annotation."""
+
+    confirmed: bool
+    preview: dict
+    result: dict | None = None
+    error: str = ""
+
+
+def create_annotation(
+    item_key: str,
+    text: str,
+    zot: ZoteroClient,
+    page: int = 0,
+    comment: str = "",
+    color: str = "#ffd400",
+    tags: list[str] | None = None,
+    confirm: bool = False,
+) -> AnnotationResult:
+    """Create a highlight annotation on a paper's PDF. Defaults to dry-run.
+
+    Automatically resolves the parent item key to the PDF attachment key.
+    """
+    attachment_key = zot.get_pdf_attachment_key(item_key)
+    if not attachment_key:
+        return AnnotationResult(
+            confirmed=False, preview={},
+            error=f"No PDF attachment found for item {item_key}.",
+        )
+
+    preview = {
+        "action": "create_annotation",
+        "item_key": item_key,
+        "attachment_key": attachment_key,
+        "page": page,
+        "text": text[:200] + ("..." if len(text) > 200 else ""),
+        "comment": comment,
+        "color": color,
+        "tags": tags or [],
+    }
+
+    if not confirm:
+        preview["next_step"] = "Call again with confirm=true to create."
+        if not zot.can_write:
+            preview["warning"] = (
+                "Write operations require ZOTERO_API_KEY and ZOTERO_LIBRARY_ID."
+            )
+        return AnnotationResult(confirmed=False, preview=preview)
+
+    if not zot.can_write:
+        return AnnotationResult(
+            confirmed=False, preview=preview,
+            error="Write operations are not available.",
+        )
+
+    try:
+        resp = zot.create_annotation(
+            attachment_key=attachment_key,
+            page=page,
+            text=text,
+            comment=comment,
+            color=color,
+            tags=tags,
+        )
+        return AnnotationResult(confirmed=True, preview=preview, result={"zotero_response": resp})
+    except Exception as e:
+        return AnnotationResult(confirmed=False, preview=preview, error=str(e))
 
 
 def search_annotations(
