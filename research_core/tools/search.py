@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from research_core.rag.reranker import get_reranker
 from research_core.rag.retriever import Retriever
+from research_core.utils import WRITE_PREVIEW_HINT
 from research_core.zotero.client import ZoteroClient
 from research_core.zotero.models import Item
 
@@ -404,7 +405,7 @@ def merge_duplicates(
             preview["duplicates"] = dup_titles
         except Exception as e:
             return MergeResult(confirmed=False, preview=preview, error=str(e))
-        preview["next_step"] = "Call again with confirm=true to execute the merge."
+        preview["next_step"] = WRITE_PREVIEW_HINT
         if not zot.can_write:
             preview["warning"] = (
                 "Write operations are not available. To enable writes, add "

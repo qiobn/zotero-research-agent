@@ -13,7 +13,7 @@ from pathlib import Path
 import httpx
 from loguru import logger
 
-from research_core.utils import escape_html
+from research_core.utils import WRITE_PREVIEW_HINT, escape_html
 from research_core.zotero.client import ZoteroClient
 
 _WRITE_DISABLED_MSG = (
@@ -53,7 +53,7 @@ def add_note(
         "note_html_length": len(note_html),
     }
     if not confirm:
-        preview["next_step"] = "Call this tool again with confirm=true to save."
+        preview["next_step"] = WRITE_PREVIEW_HINT
         if not zot.can_write:
             preview["warning"] = _WRITE_DISABLED_MSG
         return WriteResult(confirmed=False, preview=preview)
@@ -107,7 +107,7 @@ def edit_tags(
 
     preview = {"action": "edit_tags", "add": add, "remove": remove, "items": diffs}
     if not confirm:
-        preview["next_step"] = "Call this tool again with confirm=true to apply."
+        preview["next_step"] = WRITE_PREVIEW_HINT
         if not zot.can_write:
             preview["warning"] = _WRITE_DISABLED_MSG
         return WriteResult(confirmed=False, preview=preview)
@@ -144,7 +144,7 @@ def manage_collections(
             return WriteResult(confirmed=False, preview={}, error="Collection name is required.")
         preview = {"action": "create_collection", "name": name, "parent_key": parent_key}
         if not confirm:
-            preview["next_step"] = "Call again with confirm=true to create."
+            preview["next_step"] = WRITE_PREVIEW_HINT
             if not zot.can_write:
                 preview["warning"] = _WRITE_DISABLED_MSG
             return WriteResult(confirmed=False, preview=preview)
@@ -168,7 +168,7 @@ def manage_collections(
             "item_keys": item_keys,
         }
         if not confirm:
-            preview["next_step"] = "Call again with confirm=true to apply."
+            preview["next_step"] = WRITE_PREVIEW_HINT
             if not zot.can_write:
                 preview["warning"] = _WRITE_DISABLED_MSG
             return WriteResult(confirmed=False, preview=preview)
@@ -192,7 +192,7 @@ def manage_collections(
             "item_keys": item_keys,
         }
         if not confirm:
-            preview["next_step"] = "Call again with confirm=true to apply."
+            preview["next_step"] = WRITE_PREVIEW_HINT
             if not zot.can_write:
                 preview["warning"] = _WRITE_DISABLED_MSG
             return WriteResult(confirmed=False, preview=preview)
@@ -688,7 +688,7 @@ def add_paper(
             title=title,
             doi=doi or metadata.get("DOI", ""),
             metadata=metadata,
-            error="Preview only. Call again with confirm=true to add this paper.",
+            error=f"Preview only. {WRITE_PREVIEW_HINT}",
         )
 
     if not zot.can_write:

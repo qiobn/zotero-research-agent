@@ -61,3 +61,12 @@ def _flatten_items(items: list, field_name: str) -> list[str]:
 def escape_html(text: str) -> str:
     """Escape HTML special characters for safe embedding in Zotero note HTML."""
     return html.escape(text, quote=False)
+
+
+# Shown in dry-run responses so LLM clients pause for explicit user approval.
+WRITE_PREVIEW_HINT = (
+    "Preview only — nothing was changed in Zotero. "
+    "Show this preview to the user and STOP. "
+    "Do NOT call with confirm=true until the user explicitly approves "
+    "(e.g. 确认 / 同意 / 执行 / yes)."
+)

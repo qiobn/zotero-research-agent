@@ -107,12 +107,23 @@ async def _lifespan(app: FastMCP) -> AsyncIterator[None]:
     yield
 
 
+_WRITE_CONFIRMATION_POLICY = (
+    "WRITE CONFIRMATION (mandatory): First call MUST use confirm=false (default). "
+    "After preview, ask the user to approve in plain language and STOP. "
+    "NEVER set confirm=true in the same turn as the preview, and NEVER auto-confirm "
+    "because the preview looks fine. Only explicit user approval "
+    "(确认 / 同意 / 执行 / yes) authorizes confirm=true."
+)
+
 mcp = FastMCP(
     "Zotero Research Assistant",
     instructions=(
         "Help researchers discover, read, cite, and manage papers in their Zotero library. "
         "Tools compose via `item_key`: discovery tools return keys, read/write tools consume them. "
-        "Prefer search_papers as the entry point. Never call multiple search tools for the same intent."
+        "Prefer search_papers as the entry point. Never call multiple search tools for the same intent. "
+        + _WRITE_CONFIRMATION_POLICY
+        + " Tools with a confirm parameter: add_note, edit_tags, manage_collections, add_paper, "
+        "merge_duplicates, create_annotation."
     ),
     lifespan=_lifespan,
 )
@@ -306,7 +317,7 @@ def merge_duplicates(
     """Merge duplicate papers into a single keeper item.
 
     SAFETY: defaults to dry-run. First call shows what will be merged (tags,
-    collections, children to re-parent); call again with confirm=true to execute.
+    collections, children to re-parent). """ + _WRITE_CONFIRMATION_POLICY + """
 
     The merge process:
     1. Combines tags from all duplicates into the keeper
@@ -459,7 +470,7 @@ def create_annotation(
     """Create a highlight annotation on a paper's PDF.
 
     SAFETY: defaults to dry-run. First call shows a preview of the annotation
-    to be created; call again with confirm=true to save it.
+    to be created. """ + _WRITE_CONFIRMATION_POLICY + """
 
     Automatically resolves the parent item key to its PDF attachment — the user
     only needs to provide the paper's item_key, not the attachment key.
@@ -569,8 +580,8 @@ def add_paper(
     """Add a NEW paper to the Zotero library by DOI, arXiv ID, ISBN, BibTeX, or URL.
 
     SAFETY: defaults to preview mode. First call fetches metadata and shows what
-    would be created; only when called again with confirm=true does it actually
-    create the item. Automatically tries to download the open-access PDF via
+    would be created. """ + _WRITE_CONFIRMATION_POLICY + """
+    On confirm=true, automatically tries to download open-access PDF via
     arXiv → Unpaywall → Semantic Scholar → PMC waterfall.
 
     Supported identifier formats:
@@ -620,7 +631,7 @@ def add_note(
     """Attach a NOTE to a paper in the Zotero library.
 
     SAFETY: defaults to dry-run. First call returns a preview of what would be
-    created; only when called again with confirm=true does it actually save.
+    created. """ + _WRITE_CONFIRMATION_POLICY + """
 
     Use this for capturing reading notes, summaries, key insights, or any text the
     user wants permanently attached to a paper.
@@ -662,8 +673,7 @@ def edit_tags(
     """Add or remove TAGS on one or more papers.
 
     SAFETY: defaults to dry-run. First call returns a diff preview per paper
-    (current tags, what will be added, what will be removed, resulting set). Call
-    again with confirm=true to actually apply.
+    (current tags, what will be added, what will be removed, resulting set). """ + _WRITE_CONFIRMATION_POLICY + """
 
     Use this for organizing the library: bulk-categorizing papers, marking
     to-read/read, project labels, etc.
@@ -703,8 +713,7 @@ def manage_collections(
 ) -> dict:
     """Create collections (folders) or add/remove papers from them.
 
-    SAFETY: defaults to dry-run. First call shows a preview; call again with
-    confirm=true to apply.
+    SAFETY: defaults to dry-run. First call shows a preview. """ + _WRITE_CONFIRMATION_POLICY + """
 
     Actions:
       - "create":       Create a new collection. Requires `name`, optional `parent_key`.
