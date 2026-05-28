@@ -37,34 +37,40 @@ def search_papers(
     collection_key: str = "",
     limit: int = 10,
 ) -> list[PaperHit]:
-    """Hybrid search: keyword (Zotero API) + semantic (vector store) merged via RRF."""
+    """Hybrid search: keyword (Zotero API) + semantic (vector store) merged via RRF.
+
+    If query is empty, skips semantic search and returns all items matching the filters
+    (year/tags/collection), sorted by date added (most recent first).
+    """
     tag_filter: list[str] = []
     if tags_include:
         tag_filter.extend(tags_include)
     if tags_exclude:
         tag_filter.extend(f"-{t}" for t in tags_exclude)
 
+    has_query = bool(query.strip())
+
     keyword_items: list[Item] = []
-    if query.strip():
+    if has_query:
         keyword_items = zot.search_items(
             query=query,
             limit=limit * 3,
             tag=tag_filter or None,
             collection_key=collection_key,
         )
-    elif tag_filter or collection_key:
+    else:
         keyword_items = zot.search_items(
             query="",
-            limit=limit * 3,
+            limit=max(limit * 5, 100),
             tag=tag_filter or None,
             collection_key=collection_key,
         )
 
     reranker = get_reranker()
     overfetch = 3 if reranker is None else 5
-    semantic_hits = retriever.search(query, n_results=limit * overfetch) if query.strip() else []
+    semantic_hits = retriever.search(query, n_results=limit * overfetch) if has_query else []
 
-    if reranker and semantic_hits and query.strip():
+    if reranker and semantic_hits and has_query:
         docs = [h.text for h in semantic_hits]
         reranked = reranker.rerank(query, docs, top_k=limit * 3)
         semantic_hits = [semantic_hits[idx] for idx, _ in reranked]

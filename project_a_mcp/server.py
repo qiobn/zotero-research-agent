@@ -168,7 +168,7 @@ def _get_indexer() -> Indexer:
 @mcp.tool()
 @_safe_tool
 def search_papers(
-    query: str,
+    query: str = "",
     year_from: int | None = None,
     year_to: int | None = None,
     tags_include: list[str] | None = None,
@@ -183,6 +183,13 @@ def search_papers(
     AND semantic similarity against the indexed PDF chunks, merged with Reciprocal
     Rank Fusion. The user does not need to specify which mechanism.
 
+    Two usage modes:
+      1. With query: hybrid search (keyword + semantic + reranking).
+      2. Without query (query=""): pure filter mode — returns all papers matching
+         year/tags/collection filters, sorted by date added. Use this when the user
+         asks to "list papers from 2024" or "show all papers tagged X" without
+         specifying a topic.
+
     When NOT to use:
     - User already gave you a paper key → use get_paper or get_paper_content instead.
     - User wants more papers like a specific one they named → use find_similar_papers.
@@ -190,7 +197,8 @@ def search_papers(
     - User is writing a draft and wants citations for it → use suggest_citations.
 
     Args:
-        query: Natural-language topic, concept, or keyword string.
+        query: Natural-language topic, concept, or keyword string. Can be empty ("")
+               to list all papers matching the filters without topic search.
         year_from/year_to: Publication year window (inclusive). Either or both optional.
         tags_include: Only return papers carrying ALL these tags.
         tags_exclude: Drop any paper carrying ANY of these tags.
@@ -198,9 +206,9 @@ def search_papers(
         limit: Max results to return (default 10).
 
     Returns:
-        List of papers ordered by relevance, each with key, title, authors, year,
-        DOI, tags, score, source ('keyword' | 'semantic' | 'hybrid'),
-        and the best matching passage with its page number when available.
+        List of papers ordered by relevance (or date if no query), each with key,
+        title, authors, year, DOI, tags, score, source ('keyword' | 'semantic' |
+        'hybrid'), and the best matching passage with its page number when available.
     """
     hits = _search_papers(
         query=query,
