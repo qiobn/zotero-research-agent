@@ -35,6 +35,9 @@ uv.lock
 htmlcov/
 .coverage
 
+# Docs (internal guides, not for distribution)
+docs/
+
 # OS
 .DS_Store
 Thumbs.db

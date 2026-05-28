@@ -227,10 +227,16 @@ class AddPaperResult:
 
 
 def _parse_identifier(identifier: str) -> tuple[str, str]:
-    """Parse identifier into (type, value). Types: 'doi', 'arxiv', 'isbn', 'bibtex', 'url'."""
+    """Parse identifier into (type, value). Types: 'doi', 'arxiv', 'isbn', 'bibtex', 'url'.
+
+    URL detection must come before ISBN to avoid false positives (e.g. ScienceDirect
+    PII numbers contain 13+ consecutive digits that match ISBN-13 patterns).
+    """
     identifier = identifier.strip()
     if identifier.startswith("@") or identifier.startswith("{"):
         return "bibtex", identifier
+    if identifier.startswith("http"):
+        return "url", identifier
     arxiv_match = _ARXIV_RE.search(identifier)
     if arxiv_match:
         return "arxiv", arxiv_match.group(1)
@@ -240,8 +246,6 @@ def _parse_identifier(identifier: str) -> tuple[str, str]:
     isbn_match = _ISBN_RE.search(identifier)
     if isbn_match:
         return "isbn", isbn_match.group(1).replace("-", "")
-    if identifier.startswith("http"):
-        return "url", identifier
     return "doi", identifier
 
 
@@ -415,6 +419,78 @@ def _parse_bibtex(bibtex_str: str) -> dict | None:
     return {k: v for k, v in metadata.items() if v}
 
 
+_PII_RE = re.compile(r"/pii/([A-Z0-9]+)", re.IGNORECASE)
+_URL_DOI_PATTERNS = [
+    re.compile(r"link\.springer\.com/(?:article|chapter)/(?:10\.\d{4,}/[^\s?#]+)"),
+    re.compile(r"onlinelibrary\.wiley\.com/doi/(10\.\d{4,}/[^\s?#]+)"),
+    re.compile(r"nature\.com/articles/(10\.\d{4,}/[^\s?#]+)"),
+    re.compile(r"mdpi\.com/\d{4}-\d{4}/\d+/\d+/\d+"),
+]
+
+
+def _resolve_doi_from_url(url: str) -> str | None:
+    """Try to extract a DOI from a publisher URL via multiple strategies.
+
+    Strategy 1: Extract DOI from known URL patterns (Springer, Wiley, Nature).
+    Strategy 2: For ScienceDirect, extract PII and search CrossRef.
+    Strategy 3: Fetch page and parse DOI from HTML meta tags.
+    """
+    doi_in_url = re.search(r"(?:doi\.org/|/doi/|/article/)(10\.\d{4,}/[^\s?#]+)", url)
+    if doi_in_url:
+        return doi_in_url.group(1).rstrip(".")
+
+    pii_match = _PII_RE.search(url)
+    if pii_match:
+        pii = pii_match.group(1)
+        doi = _search_crossref_by_pii(pii)
+        if doi:
+            return doi
+
+    try:
+        r = httpx.get(
+            url,
+            follow_redirects=True,
+            timeout=15,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html",
+            },
+        )
+        if r.status_code != 200:
+            return None
+        text = r.text[:50000]
+        for pattern in [
+            r'<meta[^>]+name=["\'](?:citation_doi|DC\.identifier|doi|DC\.Identifier)["\'][^>]+content=["\'](?:doi:?\s*)?(10\.\d{4,}/[^"\'<>\s]+)["\']',
+            r'<meta[^>]+content=["\'](?:doi:?\s*)?(10\.\d{4,}/[^"\'<>\s]+)["\'][^>]+name=["\'](?:citation_doi|DC\.identifier|doi|DC\.Identifier)["\']',
+            r'"doi"\s*:\s*"(10\.\d{4,}/[^"]+)"',
+        ]:
+            m = re.search(pattern, text, re.IGNORECASE)
+            if m:
+                return m.group(1).rstrip(".")
+    except Exception as e:
+        logger.debug(f"DOI resolution from URL failed: {e}")
+    return None
+
+
+def _search_crossref_by_pii(pii: str) -> str | None:
+    """Search CrossRef for a DOI using a ScienceDirect PII identifier."""
+    try:
+        r = httpx.get(
+            "https://api.crossref.org/works",
+            params={"filter": f"alternative-id:{pii}", "rows": "1"},
+            headers={"User-Agent": "ZoteroResearchAssistant/0.1 (mailto:dev@example.com)"},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            items = r.json().get("message", {}).get("items", [])
+            if items:
+                return items[0].get("DOI")
+    except Exception as e:
+        logger.debug(f"CrossRef PII search failed for {pii}: {e}")
+    return None
+
+
 def _save_pdf_content(content: bytes) -> str | None:
     """Write PDF content to a temp file if it looks valid. Returns path or None."""
     if len(content) < 1000:
@@ -586,6 +662,11 @@ def add_paper(
             doi_match = _DOI_RE.search(id_value)
             if doi_match:
                 doi = doi_match.group(0).rstrip(".")
+                metadata = _fetch_metadata_crossref(doi)
+        else:
+            resolved_doi = _resolve_doi_from_url(id_value)
+            if resolved_doi:
+                doi = resolved_doi
                 metadata = _fetch_metadata_crossref(doi)
 
     if not metadata:
